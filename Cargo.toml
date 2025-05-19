@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.5.38", features = ["derive"] }
+jiff = "0.2.13"
 reqwest = "0.12.15"
 scraper = "0.23.1"
 thiserror = "2.0.12"

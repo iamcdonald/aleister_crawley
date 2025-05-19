@@ -1,8 +1,14 @@
+use jiff::Timestamp;
+use process_heap::{Process, ProcessHeap};
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
+
+mod process_heap;
 
 use crate::link_gatherer::LinkGatherer;
 use crate::link_map::{LinkMap, LinkMapValue};
 use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
 
 fn format_link_as_url(link: &str, root: &str) -> String {
     if link.starts_with("http") {
@@ -20,14 +26,25 @@ fn format_link_as_url(link: &str, root: &str) -> String {
 pub struct SiteTracer<T: LinkGatherer + Clone + 'static> {
     pub link_getter: T,
     pub worker_pool_size: u16,
+    pub initial_retry_delay_ms: u16,
+    pub max_retries: u8,
 }
 
 impl<T: LinkGatherer + Clone + 'static> SiteTracer<T> {
-    fn worker(&self, url_: &str, root_: &str) -> JoinHandle<(String, LinkMapValue)> {
+    fn worker(
+        &self,
+        url_: &str,
+        root_: &str,
+        retry: u8,
+        delay: Option<Duration>,
+    ) -> JoinHandle<(String, LinkMapValue, u8)> {
         let mut link_getter = self.link_getter.clone();
         let url = url_.to_string();
         let root = root_.to_string();
         tokio::spawn(async move {
+            if let Some(dur) = delay {
+                sleep(dur).await;
+            }
             let value = match link_getter.get_links(&url).await {
                 Ok(mut links) => {
                     links.sort();
@@ -42,43 +59,82 @@ impl<T: LinkGatherer + Clone + 'static> SiteTracer<T> {
                 }
                 Err(err) => LinkMapValue::Error(err),
             };
-            (url.to_string(), value)
+            (url.to_string(), value, retry + 1)
         })
     }
 
     pub async fn trace(&self, root: &str) -> LinkMap {
         let mut link_map = LinkMap::new(root.to_string());
         let mut seen = HashMap::from([(root.to_string(), ())]);
-        let mut queue: VecDeque<String> = VecDeque::from([root.to_string()]);
+        let mut heap = ProcessHeap::new();
         let mut processors = VecDeque::with_capacity(self.worker_pool_size as usize);
-        processors.push_front(self.worker(root, root));
+        processors.push_front(self.worker(root, root, 0, None));
 
         while let Some(result) = processors.pop_front() {
             // output some progress indication
             print!("\x1B[f\x1B[0J");
             println!(
-                "\nScraping Progress\n{} in queue\n{} found links",
-                queue.len(),
+                "\nScraping Progress\n{} in queue\n{} in processing\n{} found links",
+                heap.len(),
+                processors.len(),
                 seen.len(),
             );
+
             match result.await {
-                Ok((url, result)) => {
-                    link_map.add(url, result.clone());
-                    if let LinkMapValue::Links(links) = result {
+                Ok((url, result, retry)) => match result.clone() {
+                    LinkMapValue::Links(links) => {
+                        link_map.add(url, result);
+                        let tz = Timestamp::now();
                         for link in links {
                             if seen.contains_key(&link) {
                                 continue;
                             }
                             seen.insert(link.clone(), ());
-                            queue.push_front(link.clone());
+                            heap.push(Process {
+                                url: link.clone(),
+                                retry: 0,
+                                timestamp: tz.clone(),
+                            });
                         }
                     }
-                }
+                    LinkMapValue::Error(_) => {
+                        if retry > self.max_retries {
+                            link_map.add(url, result);
+                        } else {
+                            heap.push(Process {
+                                url: url,
+                                retry,
+                                timestamp: Timestamp::now()
+                                    .checked_add(Duration::from_millis(
+                                        self.initial_retry_delay_ms as u64
+                                            * (2 as u64).pow((retry - 1) as u32),
+                                    ))
+                                    .unwrap(),
+                            });
+                        }
+                    }
+                },
                 _ => (),
             }
             while processors.len() < (self.worker_pool_size as usize) {
-                if let Some(link) = queue.pop_front() {
-                    processors.push_back(self.worker(&link, root));
+                if let Some(Process {
+                    url,
+                    retry,
+                    timestamp,
+                }) = heap.pop()
+                {
+                    let delay = match Duration::try_from(Timestamp::now().until(timestamp).unwrap())
+                    {
+                        Ok(wait_dur) => {
+                            if wait_dur > Duration::from_millis(0) {
+                                Some(wait_dur)
+                            } else {
+                                None
+                            }
+                        }
+                        Err(_) => None,
+                    };
+                    processors.push_back(self.worker(&url, root, retry, delay));
                 } else {
                     break;
                 }
@@ -90,30 +146,56 @@ impl<T: LinkGatherer + Clone + 'static> SiteTracer<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        future::Future,
+        sync::{Arc, Mutex},
+    };
+
     use crate::{link_gatherer::URLContentGetterError, link_map::LinkMapValue};
 
     type Response = Result<Vec<String>, URLContentGetterError>;
+    #[derive(Debug, Clone)]
+    pub enum Responses {
+        Always(Response),
+        Exhaustable(VecDeque<Response>),
+    }
 
     #[derive(Clone)]
     pub struct MockLG {
-        link_map: HashMap<String, Response>,
+        link_map: Arc<Mutex<HashMap<String, Responses>>>,
     }
 
     impl MockLG {
-        pub fn new(link_map: HashMap<String, Response>) -> Self {
-            MockLG { link_map }
+        pub fn new(link_map: HashMap<String, Responses>) -> Self {
+            MockLG {
+                link_map: Arc::new(Mutex::new(link_map)),
+            }
         }
     }
 
     impl LinkGatherer for MockLG {
-        async fn get_links(&mut self, url: &str) -> Response {
-            if let Some(resp) = self.link_map.get_mut(url) {
-                return match resp {
-                    Ok(links) => Ok(links.clone()),
-                    Err(err) => Err(err.clone()),
-                };
+        fn get_links(
+            &mut self,
+            url: &str,
+        ) -> impl Future<Output = Result<Vec<String>, URLContentGetterError>> + Send {
+            async {
+                if let Some(val) = self.link_map.lock().unwrap().get_mut(url) {
+                    return match val {
+                        Responses::Always(resp) => match resp {
+                            Ok(links) => Ok(links.clone()),
+                            Err(err) => Err(err.clone()),
+                        },
+                        Responses::Exhaustable(ex) => match ex.pop_front() {
+                            Some(resp) => match resp {
+                                Ok(links) => Ok(links.clone()),
+                                Err(err) => Err(err.clone()),
+                            },
+                            _ => Ok(vec![]),
+                        },
+                    };
+                }
+                Ok(vec![])
             }
-            Ok(vec![])
         }
     }
 
@@ -126,28 +208,28 @@ mod tests {
         let mock_lg = MockLG::new(HashMap::from([
             (
                 "http://www.example.com".to_string(),
-                Ok(vec![
+                Responses::Always(Ok(vec![
                     "http://www.example.com/two".to_string(),
                     "http://www.example.com/three".to_string(),
                     "http://www.bolt.example.com/three".to_string(),
-                ]),
+                ])),
             ),
             (
                 "http://www.example.com/two".to_string(),
-                Ok(vec![
+                Responses::Always(Ok(vec![
                     "http://www.example.com/four".to_string(),
                     "http://www.google.com/six".to_string(),
                     "http://www.example.com/six".to_string(),
-                ]),
+                ])),
             ),
             (
                 "http://www.example.com/three".to_string(),
-                Ok(vec![
+                Responses::Always(Ok(vec![
                     "http://www.example.com/two".to_string(),
                     "http://www.example.com/five".to_string(),
                     "http://www.example.com/seven".to_string(),
                     "http://www.example.com/five".to_string(),
-                ]),
+                ])),
             ),
         ]));
 
@@ -177,9 +259,10 @@ mod tests {
 
         let page = SiteTracer {
             link_getter: mock_lg,
-            worker_pool_size: 5,
+            max_retries: 4,
+            worker_pool_size: 10,
+            initial_retry_delay_ms: 250,
         };
-
         let link_map = page.trace(root).await;
 
         for (key, expected) in expected.map {
@@ -208,7 +291,7 @@ mod tests {
 
         let mock_lg = MockLG::new(HashMap::from([(
             "http://www.example.com".to_string(),
-            Ok(vec!["/two".to_string(), "three".to_string()]),
+            Responses::Always(Ok(vec!["/two".to_string(), "three".to_string()])),
         )]));
 
         let mut expected = LinkMap::new(root.to_string());
@@ -222,7 +305,9 @@ mod tests {
 
         let page = SiteTracer {
             link_getter: mock_lg,
-            worker_pool_size: 5,
+            max_retries: 1,
+            worker_pool_size: 10,
+            initial_retry_delay_ms: 25,
         };
         let link_map = page.trace(root).await;
 
@@ -253,19 +338,19 @@ mod tests {
         let mock_lg = MockLG::new(HashMap::from([
             (
                 "http://www.example.com".to_string(),
-                Ok(vec![
+                Responses::Always(Ok(vec![
                     "http://www.example.com/two".to_string(),
                     "http://www.example.com/three".to_string(),
                     "http://www.bolt.example.com/three".to_string(),
-                ]),
+                ])),
             ),
             (
                 "http://www.example.com/two".to_string(),
-                Err(URLContentGetterError::Request(401)),
+                Responses::Always(Err(URLContentGetterError::Request(401))),
             ),
             (
                 "http://www.example.com/three".to_string(),
-                Err(URLContentGetterError::Content("Oh No".to_string())),
+                Responses::Always(Err(URLContentGetterError::Content("Oh No".to_string()))),
             ),
         ]));
 
@@ -288,7 +373,121 @@ mod tests {
 
         let page = SiteTracer {
             link_getter: mock_lg,
-            worker_pool_size: 5,
+            max_retries: 1,
+            worker_pool_size: 10,
+            initial_retry_delay_ms: 25,
+        };
+        let link_map = page.trace(root).await;
+
+        for (key, expected) in expected.map {
+            match expected {
+                LinkMapValue::Links(mut ex) => match link_map.map.get(&key).unwrap().clone() {
+                    LinkMapValue::Links(mut a) => {
+                        a.sort();
+                        ex.sort();
+                        assert_eq!(a, ex)
+                    }
+                    _ => assert!(false, "Actual should have Links value at {}", key),
+                },
+                LinkMapValue::Error(ex) => match link_map.map.get(&key).unwrap().clone() {
+                    LinkMapValue::Error(a) => {
+                        assert_eq!(a, ex)
+                    }
+                    _ => assert!(false, "Actual should have Error value at {}", key),
+                },
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn site_tracer_when_retry_suceeds_returns_links() {
+        let root = "http://www.example.com";
+
+        let mock_lg = MockLG::new(HashMap::from([(
+            "http://www.example.com".to_string(),
+            Responses::Exhaustable(VecDeque::from([
+                Err(URLContentGetterError::Request(401)),
+                Err(URLContentGetterError::Content(
+                    "Mysteries abound".to_string(),
+                )),
+                Err(URLContentGetterError::Request(401)),
+                Ok(vec![
+                    "http://www.example.com/two".to_string(),
+                    "http://www.example.com/three".to_string(),
+                    "http://www.bolt.example.com/three".to_string(),
+                ]),
+            ])),
+        )]));
+
+        let mut expected = LinkMap::new(root.to_string());
+        expected.add(
+            "http://www.example.com".to_string(),
+            LinkMapValue::Links(vec![
+                "http://www.example.com/two".to_string(),
+                "http://www.example.com/three".to_string(),
+            ]),
+        );
+
+        let page = SiteTracer {
+            link_getter: mock_lg,
+            max_retries: 3,
+            worker_pool_size: 10,
+            initial_retry_delay_ms: 25,
+        };
+        let link_map = page.trace(root).await;
+        for (key, expected) in expected.map {
+            match expected {
+                LinkMapValue::Links(mut ex) => match link_map.map.get(&key).unwrap().clone() {
+                    LinkMapValue::Links(mut a) => {
+                        a.sort();
+                        ex.sort();
+                        assert_eq!(a, ex)
+                    }
+                    _ => assert!(false, "Actual should have Links value at {}", key),
+                },
+                LinkMapValue::Error(ex) => match link_map.map.get(&key).unwrap().clone() {
+                    LinkMapValue::Error(a) => {
+                        assert_eq!(a, ex)
+                    }
+                    _ => assert!(false, "Actual should have Error value at {}", key),
+                },
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn site_tracer_when_max_retries_exhausted_returns_error() {
+        let root = "http://www.example.com";
+
+        let mock_lg = MockLG::new(HashMap::from([(
+            "http://www.example.com".to_string(),
+            Responses::Exhaustable(VecDeque::from([
+                Err(URLContentGetterError::Request(401)),
+                Err(URLContentGetterError::Request(401)),
+                Err(URLContentGetterError::Content(
+                    "Mysteries abound".to_string(),
+                )),
+                Ok(vec![
+                    "http://www.example.com/two".to_string(),
+                    "http://www.example.com/three".to_string(),
+                    "http://www.bolt.example.com/three".to_string(),
+                ]),
+            ])),
+        )]));
+
+        let mut expected = LinkMap::new(root.to_string());
+        expected.add(
+            "http://www.example.com".to_string(),
+            LinkMapValue::Error(URLContentGetterError::Content(
+                "Mysteries abound".to_string(),
+            )),
+        );
+
+        let page = SiteTracer {
+            link_getter: mock_lg,
+            max_retries: 2,
+            worker_pool_size: 10,
+            initial_retry_delay_ms: 25,
         };
         let link_map = page.trace(root).await;
 
