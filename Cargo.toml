@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+clap = { version = "4.5.38", features = ["derive"] }
 reqwest = "0.12.15"
 scraper = "0.23.1"
 thiserror = "2.0.12"
-tokio = { version = "1.45.0", features = ["macros"] }
+tokio = { version = "1.45.0", features = ["macros", "rt-multi-thread"] }
