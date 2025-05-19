@@ -25,7 +25,7 @@ async fn main() {
             };
 
             let link_map = st.trace(&args.url).await;
-            println!("{:?}", link_map);
+            println!("\n{}", link_map.to_tree());
         }
         Err(e) => println!("{}", e.to_string()),
     }
