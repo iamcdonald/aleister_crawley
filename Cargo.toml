@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+reqwest = "0.12.15"
+scraper = "0.23.1"
+thiserror = "2.0.12"
+tokio = { version = "1.45.0", features = ["macros"] }
