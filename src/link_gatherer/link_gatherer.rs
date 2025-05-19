@@ -1,8 +1,13 @@
+use std::future::Future;
+
 use super::{url_content_getter::URLContentGetterError, URLContentGetter};
 use scraper::{Html, Selector};
 
 pub trait LinkGatherer: Send + Sync + Clone {
-    async fn get_links(&mut self, url: &str) -> Result<Vec<String>, URLContentGetterError>;
+    fn get_links(
+        &mut self,
+        url: &str,
+    ) -> impl Future<Output = Result<Vec<String>, URLContentGetterError>> + Send;
 }
 
 #[derive(Clone, Debug)]
@@ -17,22 +22,28 @@ impl<T: URLContentGetter + Clone> Page<T> {
 }
 
 impl<T: URLContentGetter + Clone + Send + Sync> LinkGatherer for Page<T> {
-    async fn get_links(&mut self, url: &str) -> Result<Vec<String>, URLContentGetterError> {
-        let url = url.to_string();
-        match self.client.get_http_response_body(&url).await {
-            Ok(text) => {
-                let html = Html::parse_document(&text);
-                let f = html
-                    .select(&Selector::parse("a").unwrap())
-                    .into_iter()
-                    .flat_map(|f| match f.attr("href") {
-                        Some(href) => vec![href.to_string()],
-                        _ => vec![],
-                    })
-                    .collect::<Vec<_>>();
-                Ok(f)
+    fn get_links(
+        &mut self,
+        url: &str,
+    ) -> impl Future<Output = Result<Vec<String>, URLContentGetterError>> + Send {
+        async move {
+            let url = url.to_string();
+
+            match self.client.get_http_response_body(&url).await {
+                Ok(text) => {
+                    let html = Html::parse_document(&text);
+                    let f = html
+                        .select(&Selector::parse("a").unwrap())
+                        .into_iter()
+                        .flat_map(|f| match f.attr("href") {
+                            Some(href) => vec![href.to_string()],
+                            _ => vec![],
+                        })
+                        .collect::<Vec<_>>();
+                    Ok(f)
+                }
+                Err(err) => Err(err),
             }
-            Err(err) => Err(err),
         }
     }
 }

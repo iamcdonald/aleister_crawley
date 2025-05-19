@@ -1,3 +1,5 @@
+use tokio::task::JoinHandle;
+
 use crate::link_gatherer::LinkGatherer;
 use crate::link_map::{LinkMap, LinkMapValue};
 use std::collections::{HashMap, VecDeque};
@@ -17,33 +19,41 @@ fn format_link_as_url(link: &str, root: &str) -> String {
 
 pub struct SiteTracer<T: LinkGatherer + Clone + 'static> {
     pub link_getter: T,
+    pub worker_pool_size: u16,
 }
 
 impl<T: LinkGatherer + Clone + 'static> SiteTracer<T> {
-    async fn worker(&self, url: &str, root: &str) -> LinkMapValue {
+    fn worker(&self, url_: &str, root_: &str) -> JoinHandle<(String, LinkMapValue)> {
         let mut link_getter = self.link_getter.clone();
-        match link_getter.get_links(url).await {
-            Ok(mut links) => {
-                links.sort();
-                links.dedup();
+        let url = url_.to_string();
+        let root = root_.to_string();
+        tokio::spawn(async move {
+            let value = match link_getter.get_links(&url).await {
+                Ok(mut links) => {
+                    links.sort();
+                    links.dedup();
 
-                let filtered_links: Vec<String> = links
-                    .into_iter()
-                    .map(|link| format_link_as_url(&link, &root))
-                    .filter(|url| url.starts_with(&root))
-                    .collect();
-                LinkMapValue::Links(filtered_links)
-            }
-            Err(err) => LinkMapValue::Error(err),
-        }
+                    let filtered_links: Vec<String> = links
+                        .into_iter()
+                        .map(|link| format_link_as_url(&link, &root))
+                        .filter(|url| url.starts_with(&root))
+                        .collect();
+                    LinkMapValue::Links(filtered_links)
+                }
+                Err(err) => LinkMapValue::Error(err),
+            };
+            (url.to_string(), value)
+        })
     }
 
     pub async fn trace(&self, root: &str) -> LinkMap {
         let mut link_map = LinkMap::new(root.to_string());
         let mut seen = HashMap::from([(root.to_string(), ())]);
         let mut queue: VecDeque<String> = VecDeque::from([root.to_string()]);
+        let mut processors = VecDeque::with_capacity(self.worker_pool_size as usize);
+        processors.push_front(self.worker(root, root));
 
-        while let Some(url) = queue.pop_front() {
+        while let Some(result) = processors.pop_front() {
             // output some progress indication
             print!("\x1B[f\x1B[0J");
             println!(
@@ -51,15 +61,26 @@ impl<T: LinkGatherer + Clone + 'static> SiteTracer<T> {
                 queue.len(),
                 seen.len(),
             );
-            let result = self.worker(&url, root).await;
-            link_map.add(url, result.clone());
-            if let LinkMapValue::Links(links) = result {
-                for link in links {
-                    if seen.contains_key(&link) {
-                        continue;
+            match result.await {
+                Ok((url, result)) => {
+                    link_map.add(url, result.clone());
+                    if let LinkMapValue::Links(links) = result {
+                        for link in links {
+                            if seen.contains_key(&link) {
+                                continue;
+                            }
+                            seen.insert(link.clone(), ());
+                            queue.push_front(link.clone());
+                        }
                     }
-                    seen.insert(link.clone(), ());
-                    queue.push_front(link.clone());
+                }
+                _ => (),
+            }
+            while processors.len() < (self.worker_pool_size as usize) {
+                if let Some(link) = queue.pop_front() {
+                    processors.push_back(self.worker(&link, root));
+                } else {
+                    break;
                 }
             }
         }
@@ -156,6 +177,7 @@ mod tests {
 
         let page = SiteTracer {
             link_getter: mock_lg,
+            worker_pool_size: 5,
         };
 
         let link_map = page.trace(root).await;
@@ -200,6 +222,7 @@ mod tests {
 
         let page = SiteTracer {
             link_getter: mock_lg,
+            worker_pool_size: 5,
         };
         let link_map = page.trace(root).await;
 
@@ -265,6 +288,7 @@ mod tests {
 
         let page = SiteTracer {
             link_getter: mock_lg,
+            worker_pool_size: 5,
         };
         let link_map = page.trace(root).await;
 

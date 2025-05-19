@@ -22,6 +22,7 @@ async fn main() {
         Ok(args) => {
             let st = SiteTracer {
                 link_getter: Page::new(reqwest::Client::new()),
+                worker_pool_size: 10,
             };
 
             let link_map = st.trace(&args.url).await;
