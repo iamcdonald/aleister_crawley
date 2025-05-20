@@ -22,6 +22,7 @@ impl<T: URLContentGetter + Clone> Page<T> {
 }
 
 impl<T: URLContentGetter + Clone + Send + Sync> LinkGatherer for Page<T> {
+    #[tracing::instrument(skip(self))]
     fn get_links(
         &mut self,
         url: &str,
@@ -32,7 +33,7 @@ impl<T: URLContentGetter + Clone + Send + Sync> LinkGatherer for Page<T> {
             match self.client.get_http_response_body(&url).await {
                 Ok(text) => {
                     let html = Html::parse_document(&text);
-                    let f = html
+                    let links = html
                         .select(&Selector::parse("a").unwrap())
                         .into_iter()
                         .flat_map(|f| match f.attr("href") {
@@ -40,7 +41,9 @@ impl<T: URLContentGetter + Clone + Send + Sync> LinkGatherer for Page<T> {
                             _ => vec![],
                         })
                         .collect::<Vec<_>>();
-                    Ok(f)
+                    tracing::info!("Found {} links", links.len());
+                    tracing::debug!("Links {:?}", links);
+                    Ok(links)
                 }
                 Err(err) => Err(err),
             }

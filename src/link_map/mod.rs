@@ -12,7 +12,7 @@ pub enum LinkMapValue {
     Error(URLContentGetterError),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct LinkMap {
     pub root: String,
     pub map: HashMap<String, LinkMapValue>,

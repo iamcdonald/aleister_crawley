@@ -1,13 +1,13 @@
-use jiff::Timestamp;
-use process_heap::{Process, ProcessHeap};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use trace::Trace;
+use tracing::Instrument;
 
 mod process_heap;
+mod trace;
 
 use crate::link_gatherer::LinkGatherer;
 use crate::link_map::{LinkMap, LinkMapValue};
-use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 fn format_link_as_url(link: &str, root: &str) -> String {
@@ -30,123 +30,103 @@ pub struct SiteTracer<T: LinkGatherer + Clone + 'static> {
     pub max_retries: u8,
 }
 
+pub type WorkerResult = JoinHandle<(String, LinkMapValue, u8)>;
+
 impl<T: LinkGatherer + Clone + 'static> SiteTracer<T> {
-    fn worker(
-        &self,
-        url_: &str,
-        root_: &str,
-        retry: u8,
-        delay: Option<Duration>,
-    ) -> JoinHandle<(String, LinkMapValue, u8)> {
+    #[tracing::instrument(skip_all)]
+    fn worker(&self, url_: &str, root_: &str, retry: u8, delay: Option<Duration>) -> WorkerResult {
         let mut link_getter = self.link_getter.clone();
         let url = url_.to_string();
         let root = root_.to_string();
-        tokio::spawn(async move {
-            if let Some(dur) = delay {
-                sleep(dur).await;
-            }
-            let value = match link_getter.get_links(&url).await {
-                Ok(mut links) => {
-                    links.sort();
-                    links.dedup();
-
-                    let filtered_links: Vec<String> = links
-                        .into_iter()
-                        .map(|link| format_link_as_url(&link, &root))
-                        .filter(|url| url.starts_with(&root))
-                        .collect();
-                    LinkMapValue::Links(filtered_links)
+        tokio::spawn(
+            async move {
+                tracing::info!("Processing URL");
+                if let Some(dur) = delay {
+                    sleep(dur).await;
                 }
-                Err(err) => LinkMapValue::Error(err),
-            };
-            (url.to_string(), value, retry + 1)
-        })
+                let value = match link_getter.get_links(&url).await {
+                    Ok(mut links) => {
+                        links.sort();
+                        links.dedup();
+
+                        let filtered_links: Vec<String> = links
+                            .into_iter()
+                            .map(|link| format_link_as_url(&link, &root))
+                            .filter(|url| url.starts_with(&root))
+                            .collect();
+                        tracing::info!("Filtered to {} links", filtered_links.len());
+                        tracing::debug!("Filtered Links {:?}", filtered_links);
+                        LinkMapValue::Links(filtered_links)
+                    }
+                    Err(err) => LinkMapValue::Error(err),
+                };
+                tracing::info!("Finished processing URL");
+                (url.to_string(), value, retry + 1)
+            }
+            .instrument(tracing::info_span!(
+                "thread",
+                url = url_.to_string(),
+                retry = retry,
+                delay = format!("{:?}", delay)
+            )),
+        )
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn trace(&self, root: &str) -> LinkMap {
-        let mut link_map = LinkMap::new(root.to_string());
-        let mut seen = HashMap::from([(root.to_string(), ())]);
-        let mut heap = ProcessHeap::new();
-        let mut processors = VecDeque::with_capacity(self.worker_pool_size as usize);
-        processors.push_front(self.worker(root, root, 0, None));
+        tracing::info!("Begining trace");
+        let mut trace = Trace::new(root, self.worker_pool_size);
+        trace.push_processor(self.worker(root, root, 0, None));
 
-        while let Some(result) = processors.pop_front() {
-            // output some progress indication
+        print!("\x1B[2J\x1B[H");
+
+        while let Some(result) = trace.get_next_processor() {
             print!("\x1B[f\x1B[0J");
-            println!(
-                "\nScraping Progress\n{} in queue\n{} in processing\n{} found links",
-                heap.len(),
-                processors.len(),
-                seen.len(),
-            );
+            println!("{}", trace);
 
             match result.await {
                 Ok((url, result, retry)) => match result.clone() {
                     LinkMapValue::Links(links) => {
-                        link_map.add(url, result);
-                        let tz = Timestamp::now();
+                        trace.add_result(&url, result);
                         for link in links {
-                            if seen.contains_key(&link) {
-                                continue;
-                            }
-                            seen.insert(link.clone(), ());
-                            heap.push(Process {
-                                url: link.clone(),
-                                retry: 0,
-                                timestamp: tz.clone(),
-                            });
+                            trace.queue_to_process(&link, 0, &self.initial_retry_delay_ms);
                         }
                     }
                     LinkMapValue::Error(_) => {
                         if retry > self.max_retries {
-                            link_map.add(url, result);
+                            trace.add_result(&url, result);
                         } else {
-                            heap.push(Process {
-                                url: url,
-                                retry,
-                                timestamp: Timestamp::now()
-                                    .checked_add(Duration::from_millis(
-                                        self.initial_retry_delay_ms as u64
-                                            * (2 as u64).pow((retry - 1) as u32),
-                                    ))
-                                    .unwrap(),
-                            });
+                            trace.queue_to_process(&url, retry, &self.initial_retry_delay_ms);
                         }
                     }
                 },
                 _ => (),
             }
-            while processors.len() < (self.worker_pool_size as usize) {
-                if let Some(Process {
-                    url,
-                    retry,
-                    timestamp,
-                }) = heap.pop()
-                {
-                    let delay = match Duration::try_from(Timestamp::now().until(timestamp).unwrap())
-                    {
-                        Ok(wait_dur) => {
-                            if wait_dur > Duration::from_millis(0) {
-                                Some(wait_dur)
-                            } else {
-                                None
-                            }
-                        }
-                        Err(_) => None,
-                    };
-                    processors.push_back(self.worker(&url, root, retry, delay));
+            while trace.has_process_capacity() {
+                if let Some(process) = trace.get_next_process() {
+                    trace.push_processor(self.worker(
+                        &process.url,
+                        root,
+                        process.retry,
+                        process.get_delay(),
+                    ));
                 } else {
                     break;
                 }
             }
         }
-        link_map
+
+        print!("\x1B[f\x1B[0J");
+        println!("{}", trace);
+        tracing::info!("Finished trace");
+        trace.get_result()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::{HashMap, VecDeque},
         future::Future,
         sync::{Arc, Mutex},
     };

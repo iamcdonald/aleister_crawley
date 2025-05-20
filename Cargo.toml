@@ -10,3 +10,5 @@ reqwest = "0.12.15"
 scraper = "0.23.1"
 thiserror = "2.0.12"
 tokio = { version = "1.45.0", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }

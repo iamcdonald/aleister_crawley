@@ -18,6 +18,7 @@ pub trait URLContentGetter {
 }
 
 impl URLContentGetter for reqwest::Client {
+    #[tracing::instrument(skip(self))]
     fn get_http_response_body(
         &self,
         url: &str,
@@ -29,11 +30,17 @@ impl URLContentGetter for reqwest::Client {
             match self.get(url).headers(headers).send().await {
                 Ok(resp) => match resp.text().await {
                     Ok(content) => Ok(content),
-                    Err(err) => Err(URLContentGetterError::Content(err.to_string())),
+                    Err(err) => {
+                        tracing::error!("{}", err.to_string());
+                        Err(URLContentGetterError::Content(err.to_string()))
+                    }
                 },
-                Err(err) => Err(URLContentGetterError::Request(
-                    err.status().and_then(|sc| Some(sc.as_u16())).unwrap_or(0),
-                )),
+                Err(err) => {
+                    tracing::error!("{}", err.to_string());
+                    Err(URLContentGetterError::Request(
+                        err.status().and_then(|sc| Some(sc.as_u16())).unwrap_or(0),
+                    ))
+                }
             }
         }
     }
